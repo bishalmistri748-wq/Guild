@@ -7,15 +7,15 @@ GUILD GLORY — PREMIUM WEB CONTROL
    python app.py
 
 3. Open the web dashboard:
-   http://127.0.0.1:25086
+   http://127.0.0.1:<PORT_SHOWN_IN_TERMINAL>
    For a hosted deployment, open your hosting provider's public URL.
 
 GUILD DASHBOARD
 - Select a Guild ID and region.
 - Use Preview Guild to inspect basic guild information.
-- Press Start Guild + Auto Join to save the selected guild, send join requests
-  for the UID/password accounts already in accounts.json, and start the glory
-  tracking workflow when the game worker callback is available.
+- Choose an account count (0 means ALL saved UID/password accounts), then press
+  Start Glory to save the selected guild, send join requests for that selection,
+  and start the existing worker workflow. The dashboard itself starts idle.
 - Use Refresh Guild to request a fresh guild snapshot.
 - The dashboard shows current glory, tracked bot contribution, member details,
   and next-level remaining glory when the guild API provides the required
@@ -25,9 +25,10 @@ GUILD DASHBOARD
 
 ACCOUNT MANAGER
 - Add UID/password accounts or JWT tokens from the website.
-- When a guild has been selected and saved, adding a UID/password account
-  queues a join request to that guild automatically.
-- Account join requests are logged in the website's Live Logs panel.
+- Adding an account saves it but does not start a gameplay worker while Glory is
+  stopped. Workers start only after Start Glory is pressed.
+- Use Auto Guild Join to send requests for saved UID/password accounts. Results
+  are logged per UID in the website's Live Logs panel.
 - Existing accounts are loaded from accounts.json.
 
 WEBSITE CONTROL
@@ -48,3 +49,13 @@ IMPORTANT
   next-level target/remaining field. The dashboard does not guess thresholds.
 - Keep the dashboard private or protect it with authentication before public
   deployment. The existing API routes should not be exposed to untrusted users.
+
+
+ANDROID / TERMUX
+- Extract the ZIP, cd into the extracted project folder, then run:
+  pip install -r requirements.txt
+  python app.py
+- Open http://127.0.0.1:<PORT_SHOWN_IN_TERMINAL> in the same phone's browser.
+- Keep the Termux process running while using the dashboard.
+- Runtime credential/cache JSON files are shipped empty; add your own authorized
+  accounts again. Never expose this dashboard to the public internet.
