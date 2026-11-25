@@ -4,7 +4,7 @@ GUILD GLORY — PREMIUM WEB CONTROL
    pip install -r requirements.txt
 
 2. Start the project:
-   python app.py
+   python glory_runner.py
 
 3. Open the web dashboard:
    http://127.0.0.1:<PORT_SHOWN_IN_TERMINAL>
@@ -54,7 +54,7 @@ IMPORTANT
 ANDROID / TERMUX
 - Extract the ZIP, cd into the extracted project folder, then run:
   pip install -r requirements.txt
-  python app.py
+  python glory_runner.py
 - Open http://127.0.0.1:<PORT_SHOWN_IN_TERMINAL> in the same phone's browser.
 - Keep the Termux process running while using the dashboard.
 - Runtime credential/cache JSON files are shipped empty; add your own authorized
