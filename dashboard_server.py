@@ -402,7 +402,7 @@ async def handle_activate_old(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 def _banned_snapshot():
-    """banned_accounts.json (app.py likhta hai) + memory se banned accounts ki list, dashboard ke liye."""
+    """banned_accounts.json (glory_runner.py likhta hai) + memory se banned accounts ki list, dashboard ke liye."""
     data = {}
     try:
         with open(BANNED_FILE, "r", encoding="utf-8") as f:
@@ -1763,7 +1763,7 @@ async def handle_normal_matchmaking_start(request: web.Request) -> web.Response:
             return web.json_response({"status": "error", "error": "Select at least one complete unlocked group"}, status=400)
         callback = bot_state.refresh_callbacks.get("on_glory_start")
         if not callback:
-            return web.json_response({"status": "error", "error": "Normal Glory worker callback is not ready; start app.py first"}, status=503)
+            return web.json_response({"status": "error", "error": "Normal Glory worker callback is not ready; start glory_runner.py first"}, status=503)
         bot_state.glory_started = True
         result = await callback(selected)
         labels = [g.get("group") for g in chosen]
@@ -1832,14 +1832,14 @@ async def _run_account_creation(name: str, quantity: int, region: str):
     bot_state.automation.update({"running": True, "stage": "account_create", "target": quantity, "created": 0, "joined": 0, "failed": 0, "message": "Starting account generator", "started_at": time.time()})
     try:
         import importlib.util
-        generator_path = os.path.join(PROJECT_DIR, "main.py")
+        generator_path = os.path.join(PROJECT_DIR, "account_creator.py")
         spec = importlib.util.spec_from_file_location("glory_account_generator", generator_path)
         if not spec or not spec.loader:
-            raise RuntimeError("main.py generator could not be loaded")
+            raise RuntimeError("account_creator.py generator could not be loaded")
         generator = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(generator)
         if generator.is_system_expired():
-            raise RuntimeError("The existing main.py account generator is expired")
+            raise RuntimeError("The existing account_creator.py account generator is expired")
         generator.set_custom_name(name)
         region_file = "account_bd.json" if region == "BD" else "account_ind.json"
         semaphore = asyncio.Semaphore(25)
@@ -1873,7 +1873,7 @@ async def _run_account_creation(name: str, quantity: int, region: str):
         workers = [asyncio.create_task(worker()) for _ in range(min(20, quantity * 2))]
         await asyncio.gather(*workers, return_exceptions=True)
 
-        # main.py writes both the regional generator file and accounts.json.
+        # account_creator.py writes both the regional generator file and accounts.json.
         # Reconcile the regional file into the canonical dashboard store as a
         # defensive compatibility step; append-only UID merge prevents loss.
         regional_path = os.path.join(PROJECT_DIR, region_file)
@@ -1919,8 +1919,29 @@ async def handle_api_groups(request: web.Request) -> web.Response:
 
 # ==================== START WEB DASHBOARD ====================
 
+@web.middleware
+async def _cors_middleware(request, handler):
+    # Dashboard may be served by Railway or by a Vercel static frontend.
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        response = await handler(request)
+    origin = request.headers.get("Origin", "*")
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+async def _handle_options(request):
+    return web.Response(status=204)
+
+
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
+    app.router.add_route("OPTIONS", "/{tail:.*}", _handle_options)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/health", handle_health)
     app.router.add_post("/api/setup", handle_api_setup)
@@ -1952,7 +1973,7 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
         site = web.TCPSite(runner, host, port)
         await site.start()
     except Exception:
-        # Release partially-created listeners before app.py retries another port.
+        # Release partially-created listeners before glory_runner.py retries another port.
         await runner.cleanup()
         raise
     _archive_accounts()      # dashboard start par bhi: jo accounts accounts.json mein hain unka archive
