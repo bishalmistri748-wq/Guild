@@ -833,9 +833,22 @@ async def send_getlogin(data, base_url, token, release_version):
         try:
             parsed = Parser().parse(c.hex())
             dd = await parse_results(parsed)
-        except Exception: pass
+        except Exception as parse_err:
+            print_warning(f"[GETLOGIN] protobuf metadata parse failed: {type(parse_err).__name__}: {parse_err}")
+
+        # Do not treat an empty/default protobuf object as a successful login.
+        functional = rp.functional_addrs or get_proto_field(dd, 14)
+        informational = rp.informational_addrs or get_proto_field(dd, 32)
+        if not functional:
+            print_error(
+                f"[GETLOGIN] invalid response: functional gateway missing "
+                f"(informational={bool(informational)}, bytes={len(c)})"
+            )
+            return None
         return rp, dd
-    except Exception: return None
+    except Exception as e:
+        print_error(f"[GETLOGIN] {type(e).__name__}: {e}")
+        return None
 
 # ═══════════════════════════ HTTP PING ═══════════════════════════
 async def send_ping(account_id, token, release_version):
@@ -1967,12 +1980,21 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
 
                 rip = await resolve_host_cloudflare(ip)
-                reader, writer = await asyncio.open_connection(rip, int(port))
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(rip, int(port)), timeout=15.0
+                )
                 _writer_ref["w"] = writer
                 raw_sock = writer.get_extra_info('socket')
                 if raw_sock: optimize_tcp_socket(raw_sock)
                 await asyncio.sleep(bypass_hello_delay())
-                writer.write(bytes.fromhex(current_token)); await writer.drain()
+                try:
+                    startup_bytes = bytes.fromhex(current_token)
+                except (TypeError, ValueError) as packet_err:
+                    raise ConnectionError(f"invalid TCP startup packet: {packet_err}") from packet_err
+                if not startup_bytes:
+                    raise ConnectionError("empty TCP startup packet")
+                writer.write(startup_bytes)
+                await asyncio.wait_for(writer.drain(), timeout=10.0)
                 try:
                     ka = await send_keep_alive(account_region)
                     if ka and not writer.is_closing():
@@ -1986,7 +2008,12 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         try:
                             if writer and not writer.is_closing():
                                 writer.write(ka_bytes); await writer.drain()
-                        except Exception: break
+                        except Exception as keepalive_err:
+                            print_warning(
+                                f"[KEEPALIVE] {uid_str} failed: "
+                                f"{type(keepalive_err).__name__}: {keepalive_err}"
+                            )
+                            break
                 gateway_ping_task = asyncio.create_task(func_gateway_keepalive())
 
                 connection_start_time = asyncio.get_running_loop().time()
@@ -2380,6 +2407,13 @@ async def process_account_uid_pass(uid, password):
         if not lpd: return None
         mresp = await send_majorlogin(lpd, rel, su)
         if mresp is None: return None
+        try:
+            login_uid = int(mresp.account_id)
+        except (TypeError, ValueError):
+            login_uid = 0
+        if login_uid <= 0 or not mresp.token or not mresp.url or not mresp.aes_ak or not mresp.iv_i:
+            print_error(f"[LOGIN] invalid MajorLogin response for auth UID {uid}: account_id={login_uid}")
+            return None
         gl = await send_getlogin(lpd, mresp.url, mresp.token, rel)
         if gl is None: return None
         rp, dd = gl
@@ -2438,6 +2472,13 @@ async def process_account_token(access_token):
         if not lpd: return None
         mresp = await send_majorlogin(lpd, rel, su)
         if mresp is None: return None
+        try:
+            login_uid = int(mresp.account_id)
+        except (TypeError, ValueError):
+            login_uid = 0
+        if login_uid <= 0 or not mresp.token or not mresp.url or not mresp.aes_ak or not mresp.iv_i:
+            print_error(f"[LOGIN] invalid MajorLogin response for token account: account_id={login_uid}")
+            return None
         gl = await send_getlogin(lpd, mresp.url, mresp.token, rel)
         if gl is None: return None
         rp, dd = gl
@@ -2466,7 +2507,13 @@ async def process_account_token(access_token):
         print_error(f"process_account_token: {e}"); return None
 
 async def run_account_worker(ad, label):
-    acc_id = str(ad['account_id'])
+    try:
+        acc_id_num = int(ad.get('account_id', 0))
+    except (TypeError, ValueError):
+        acc_id_num = 0
+    if acc_id_num <= 0:
+        raise ValueError(f"refusing to start worker with invalid account_id={ad.get('account_id')!r}")
+    acc_id = str(acc_id_num)
     info_task = None; exp_task = None; ping_task = None
     try:
         reg = ad.get('region', 'ID')

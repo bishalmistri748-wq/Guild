@@ -671,11 +671,18 @@ class BotState:
 
     def update_status(self, uid: str, status: str, active_matches: Optional[int] = None):
         uid_str = str(uid)
-        if uid_str in self.accounts:
-            self.accounts[uid_str]["status"] = status
+        # Login workers often report the guest/auth UID while dashboard rows
+        # are keyed by the in-game UID. Resolve both directions before updating.
+        target_uid = uid_str
+        if target_uid not in self.accounts:
+            mapped = self.auth_to_game_id.get(uid_str) or self.game_to_auth_id.get(uid_str)
+            if mapped and str(mapped) in self.accounts:
+                target_uid = str(mapped)
+        if target_uid in self.accounts:
+            self.accounts[target_uid]["status"] = status
             if active_matches is not None:
-                self.accounts[uid_str]["active_matches"] = active_matches
-            self.accounts[uid_str]["last_updated"] = time.strftime("%H:%M:%S")
+                self.accounts[target_uid]["active_matches"] = active_matches
+            self.accounts[target_uid]["last_updated"] = time.strftime("%H:%M:%S")
 
 
     def record_relogin(self, uid: str, state: str, message: str = ""):
