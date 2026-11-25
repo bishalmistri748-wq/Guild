@@ -2,7 +2,10 @@
 # ═══════════════════════════════════════════════════════════════════
 #  TEAM RBC — Squad Bot (Create → Invite → Accept → PK → In-Game)
 # ═══════════════════════════════════════════════════════════════════
-import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
+import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid, signal
+
+# Keep runtime JSON files and Web_temp anchored to this project directory.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import itertools, secrets, traceback, base64
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -27,7 +30,44 @@ from dashboard_server import bot_state, start_web_dashboard
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 25086
+WEB_PORT = 25087  # Updated at every launch; first run starts here.
+PORT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".glory_dashboard_port")
+PORT_BASE = 25087
+PORT_SCAN_LIMIT = 1000
+
+def _choose_dashboard_port():
+    """Choose a fresh incrementing port on every launch and persist it.
+
+    The first launch uses 25087; later launches use the previous port + 1.
+    If a candidate is occupied, continue upward until a free port is found.
+    """
+    last_port = PORT_BASE - 1
+    try:
+        with open(PORT_STATE_FILE, "r", encoding="ascii") as fh:
+            last_port = max(PORT_BASE - 1, int(fh.read().strip()))
+    except (OSError, ValueError):
+        pass
+
+    candidate = last_port + 1
+    for _ in range(PORT_SCAN_LIMIT):
+        if candidate > 65535:
+            candidate = PORT_BASE
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("0.0.0.0", candidate))
+        except OSError:
+            candidate += 1
+            continue
+        finally:
+            probe.close()
+
+        tmp = PORT_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="ascii") as fh:
+            fh.write(str(candidate))
+        os.replace(tmp, PORT_STATE_FILE)
+        return candidate
+    raise OSError("No free dashboard port found in the configured scan range")
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
@@ -2648,36 +2688,30 @@ async def main():
         print_info(f"  heartbeat={TEAM_HEARTBEAT_INTERVAL}s | final_wait={TEAM_FINAL_WAIT}s")
     print_colored("=" * 60, Colors.CYAN)
 
-    # Dashboard: if the default port is already occupied (for example, by
-    # another still-running bot process), try a small range of alternatives.
-    dashboard_started = False
-    for dashboard_port in range(WEB_PORT, WEB_PORT + 11):
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            probe.bind((WEB_HOST, dashboard_port))
-        except OSError as port_error:
-            if getattr(port_error, "errno", None) in (98, 48, 10048):
+    # One dashboard only: Matchmaking + Account Manager share one dynamically
+    # selected port. The port increments on every app.py launch (25087, 25088, ...).
+    global WEB_PORT
+    try:
+        last_error = None
+        for _ in range(PORT_SCAN_LIMIT):
+            WEB_PORT = _choose_dashboard_port()
+            try:
+                await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
+                print_success(
+                    f"Dashboard ready: http://127.0.0.1:{WEB_PORT} "
+                    "(Matchmaking + Accounts on the same website)"
+                )
+                break
+            except OSError as exc:
+                last_error = exc
+                # A process may claim the port between the availability probe
+                # and aiohttp bind. Advance the persisted counter and retry.
                 continue
-            print_error(f"Dashboard port check failed: {port_error}")
-            break
-        finally:
-            probe.close()
-        try:
-            await start_web_dashboard(host=WEB_HOST, port=dashboard_port)
-            print_success(f"Dashboard: http://localhost:{dashboard_port}")
-            dashboard_started = True
-            break
-        except OSError as start_error:
-            if getattr(start_error, "errno", None) in (98, 48, 10048):
-                continue
-            print_error(f"Dashboard: {start_error}")
-            break
-        except Exception as start_error:
-            print_error(f"Dashboard: {start_error}")
-            break
-    if not dashboard_started:
-        print_warning("Dashboard unavailable; bot process will continue without dashboard.")
+        else:
+            raise OSError(f"Could not bind a free dashboard port: {last_error}")
+    except Exception as start_error:
+        print_error(f"Dashboard startup failed: {type(start_error).__name__}: {start_error}")
+        return
 
     def _worker_is_running(key):
         task = bot_state.account_workers.get(str(key))
@@ -2701,13 +2735,18 @@ async def main():
         return True
 
     async def on_account_added(data):
-        if not isinstance(data, dict):
+        # Saving an account must never start gameplay by itself.
+        if not isinstance(data, dict) or not bot_state.glory_started:
             return
         _ensure_account_worker(data)
 
-    async def on_glory_start():
-        # Reconcile the full saved roster when dashboard starts Glory.
+    async def on_glory_start(selected_uids=None):
+        # Start only after the user presses Start Glory. An optional UID list
+        # limits this run to the selected number of saved accounts.
         roster = load_accounts()
+        if selected_uids is not None:
+            allowed = {str(uid) for uid in selected_uids}
+            roster = [a for a in roster if str(a.get('uid') or a.get('login_uid') or a.get('token', '')[:10]) in allowed]
         _configure_team_roster(len(roster))
         started = sum(1 for account in roster if _ensure_account_worker(account))
         bot_state.log(
@@ -2729,8 +2768,8 @@ async def main():
     _configure_team_roster(len(accounts))
     if not accounts:
         print_warning(f"No accounts in {ACCOUNTS_FILE}. Add via dashboard.")
-    for acc in accounts:
-        _ensure_account_worker(acc)
+    # Deliberately do not start account workers here. The dashboard is idle
+    # until the user explicitly presses Start Glory.
 
     # Telegram control removed: all administration is handled by the web dashboard.
 

@@ -189,6 +189,13 @@ EXP_TABLE: Dict[int, int] = {
     100: 32032884
 }
 
+async def handle_health(request: web.Request) -> web.Response:
+    transport = request.transport
+    sockname = transport.get_extra_info("sockname") if transport else None
+    actual_port = int(sockname[1]) if sockname and len(sockname) > 1 else None
+    return web.json_response({"application": "GLORY_DASHBOARD", "status": "ok", "port": actual_port})
+
+
 async def handle_index(request: web.Request) -> web.Response:
     content = FALLBACK_INDEX_HTML
     if os.path.exists(TEMPLATE_PATH):
@@ -205,6 +212,106 @@ BANNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banned_a
 # ---- Purane accounts: accounts.json har baar "fresh pool" mein khaali ho jata hai, isliye purane accounts ka
 # ---- automatic archive (accounts_archive.json) rakhte hain. Dashboard se jab chaho unhe wapas activate kar sakte ho.
 ARCHIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_archive.json")
+GROUPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "account_groups.json")
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _saved_accounts():
+    rows = _read_json_list(os.path.join(PROJECT_DIR, "accounts.json"))
+    out, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        uid = str(row.get("uid") or row.get("login_uid") or "").strip()
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.append(row)
+    return out
+
+
+def _sync_account_groups():
+    """Append unassigned accounts to stable four-account groups; never reshuffle old assignments."""
+    data = {"team_size": 4, "groups": []}
+    try:
+        with open(GROUPS_FILE, "r", encoding="utf-8") as fh:
+            old = json.load(fh)
+        if isinstance(old, dict) and isinstance(old.get("groups"), list):
+            data = old
+    except Exception:
+        pass
+    groups = data.setdefault("groups", [])
+    assigned = set()
+    for index, group in enumerate(groups, 1):
+        group["group"] = str(group.get("group") or f"Group {index}")
+        group["uids"] = list(dict.fromkeys(str(x) for x in group.get("uids", []) if str(x)))[:4]
+        assigned.update(group["uids"])
+    for account in _saved_accounts():
+        uid = str(account.get("uid") or account.get("login_uid") or "").strip()
+        if not uid or uid in assigned:
+            continue
+        target = next((g for g in groups if len(g.get("uids", [])) < 4), None)
+        if target is None:
+            target = {"group": f"Group {len(groups)+1}", "uids": []}
+            groups.append(target)
+        target["uids"].append(uid)
+        assigned.add(uid)
+    payload = {"team_size": 4, "groups": groups}
+    tmp = GROUPS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, GROUPS_FILE)
+    return payload
+
+
+def _normalise_group_ids(values):
+    """Accept UI group labels or numeric IDs and return canonical Group N labels."""
+    out = []
+    for value in values or []:
+        raw = str(value).strip()
+        if raw.lower().startswith("group "):
+            raw = raw.split(None, 1)[1]
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            label = f"Group {number}"
+            if label not in out:
+                out.append(label)
+    return out
+
+
+def _set_group_lock(group_id: str, locked: bool):
+    wanted = _normalise_group_ids([group_id])
+    if not wanted:
+        raise ValueError("Valid group number is required")
+    data = _sync_account_groups()
+    for group in data.get("groups", []):
+        if str(group.get("group")) == wanted[0]:
+            group["locked"] = bool(locked)
+            _write_json_atomic(GROUPS_FILE, data)
+            return group
+    raise ValueError(f"{wanted[0]} does not exist")
+
+
+def _selected_group_roster(group_ids):
+    """Return full, unlocked selected groups and their saved account UIDs."""
+    wanted = set(_normalise_group_ids(group_ids))
+    if not wanted:
+        raise ValueError("Select at least one group")
+    groups = _sync_account_groups().get("groups", [])
+    chosen = [g for g in groups if str(g.get("group")) in wanted]
+    missing = wanted - {str(g.get("group")) for g in chosen}
+    if missing:
+        raise ValueError("Unknown group(s): " + ", ".join(sorted(missing)))
+    locked = [str(g.get("group")) for g in chosen if g.get("locked")]
+    if locked:
+        raise ValueError("Unlock these groups before starting: " + ", ".join(locked))
+    incomplete = [str(g.get("group")) for g in chosen if len(g.get("uids", [])) != 4]
+    if incomplete:
+        raise ValueError("Each selected squad must contain exactly 4 accounts. Incomplete: " + ", ".join(incomplete))
+    return chosen, [str(uid) for g in chosen for uid in g.get("uids", [])]
+
 
 def _read_json_list(path):
     try:
@@ -317,6 +424,12 @@ async def handle_get_stats(request: web.Request) -> web.Response:
     except Exception:
         _log_n = 80
     accounts_data = list(bot_state.accounts.values())
+    known_ids = {str(a.get("uid") or "") for a in accounts_data}
+    for saved in _saved_accounts():
+        saved_uid = str(saved.get("uid") or saved.get("login_uid") or "")
+        if saved_uid and saved_uid not in known_ids:
+            accounts_data.append({"uid": saved_uid, "nickname": saved.get("nickname") or saved.get("name") or "Saved account", "level": 0, "gained_exp": 0, "status": "Saved", "active_matches": 0, "matches_played": 0})
+            known_ids.add(saved_uid)
     accounts_data.sort(key=lambda x: x.get("gained_exp", 0), reverse=True)
     uptime_sec = max(1, int(time.time() - bot_state.start_time))
     total_gained = bot_state.total_gained_exp
@@ -328,8 +441,17 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
 
+    groups_data = _sync_account_groups()
+    saved_accounts = _saved_accounts()
+    running_ids = {str(k) for k, task in bot_state.account_workers.items() if task is not None and not task.done()}
     return web.json_response({
-        "total_accounts": len(bot_state.accounts),
+        "total_accounts": max(len(bot_state.accounts), len(saved_accounts)),
+        "saved_accounts": len(saved_accounts),
+        "running_accounts": len(running_ids),
+        "available_accounts": max(0, len(saved_accounts) - len(running_ids)),
+        "failed_accounts": sum(1 for a in accounts_data if str(a.get("status", "")).lower() in {"failed", "offline", "error"}),
+        "groups": groups_data,
+        "normal_groups": groups_data.get("groups", [])[:6],
         "total_matches": bot_state.total_matches,
         "total_matches_started": bot_state.total_matches_started,   # 🔥 NEW
         "total_active_matches": total_active_matches,
@@ -731,6 +853,13 @@ FALLBACK_INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+async def handle_health(request: web.Request) -> web.Response:
+    transport = request.transport
+    sockname = transport.get_extra_info("sockname") if transport else None
+    actual_port = int(sockname[1]) if sockname and len(sockname) > 1 else None
+    return web.json_response({"application": "GLORY_DASHBOARD", "status": "ok", "port": actual_port})
+
+
 async def handle_index(request: web.Request) -> web.Response:
     content = FALLBACK_INDEX_HTML
     if os.path.exists(TEMPLATE_PATH):
@@ -743,7 +872,7 @@ async def handle_index(request: web.Request) -> web.Response:
 
 # ==================== GUILD SETUP / JOIN API ENDPOINTS ====================
 async def _load_accounts_for_join():
-    accounts_file = "accounts.json"
+    accounts_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
     try:
         with open(accounts_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -809,7 +938,7 @@ async def _send_external_join(guild_id: str, uid: str, password: str):
         return r.status_code, data
 
 
-async def _run_automation(guild_id: str, region: str, total: int, threads: int, fresh_pool: bool):
+async def _run_automation(guild_id: str, region: str, total: int, threads: int, fresh_pool: bool, account_count: int = 0):
     """Generate accounts -> fetch guild -> send join requests -> start Glory."""
     bot_state.automation.update({
         "running": True, "stage": "generating", "target": total,
@@ -847,8 +976,10 @@ async def _run_automation(guild_id: str, region: str, total: int, threads: int, 
         bot_state.automation["stage"] = "joining"
         bot_state.automation["message"] = "Sending join requests…"
         accounts = await _load_accounts_for_join()
+        if account_count > 0:
+            accounts = accounts[:account_count]
         if not accounts:
-            raise RuntimeError("No valid UID/password entries found in accounts.json")
+            raise RuntimeError("No valid UID/password entries found in the selected account range")
 
         join_results = []
         for account in accounts:
@@ -875,8 +1006,11 @@ async def _run_automation(guild_id: str, region: str, total: int, threads: int, 
         bot_state.automation["message"] = "Starting AjayXGlory…"
         if "on_glory_start" not in bot_state.refresh_callbacks:
             raise RuntimeError("Glory start callback is not ready yet")
-        await bot_state.refresh_callbacks["on_glory_start"]()
         bot_state.glory_started = True
+        try:
+            await bot_state.refresh_callbacks["on_glory_start"]([a["uid"] for a in accounts])
+        except TypeError:
+            await bot_state.refresh_callbacks["on_glory_start"]()
         bot_state.setup_complete = True
         bot_state.log(f"AjayXGlory started | {len(accounts)} account(s)", "success")
         bot_state.automation.update({"running": False, "stage": "done", "message": "Generation → Join → Glory complete"})
@@ -907,6 +1041,94 @@ async def handle_api_start(request: web.Request) -> web.Response:
     return web.json_response({"status": "started", "automation": bot_state.automation})
 
 
+async def _run_guild_join_only(guild_id: str, region: str, account_count: int):
+    """Send guild-join requests for saved accounts only; never starts gameplay."""
+    bot_state.automation.update({
+        "running": True, "stage": "guild_join", "target": account_count,
+        "created": 0, "joined": 0, "failed": 0,
+        "message": "Preparing saved accounts for guild join…", "started_at": time.time()
+    })
+    try:
+        accounts = await _load_accounts_for_join()
+        if account_count > 0:
+            accounts = accounts[:account_count]
+        if not accounts:
+            raise RuntimeError("No saved UID/password accounts found in accounts.json")
+
+        bot_state.automation["target"] = len(accounts)
+        bot_state.automation["message"] = f"Sending guild join requests for {len(accounts)} account(s)…"
+        try:
+            external_info = await _fetch_external_guild_info(guild_id, region)
+            guild_data = external_info
+            if isinstance(external_info, dict) and isinstance(external_info.get("api_response"), dict):
+                guild_data = external_info["api_response"].get("clan_basic_info", external_info)
+            if not isinstance(guild_data, dict):
+                guild_data = {}
+            _save_guild_config(guild_id, region, guild_data)
+            bot_state.log(f"Guild selected: ID {guild_id} | Region {region}", "info")
+        except Exception as exc:
+            # Join endpoint may still accept a guild ID when the info endpoint is unavailable.
+            bot_state.log(f"Guild preview unavailable; continuing join requests: {exc}", "warning")
+            bot_state.guild_config = {"guild_id": guild_id, "region": region}
+
+        results = []
+        for account in accounts:
+            uid = account["uid"]
+            try:
+                http_status, result = await _send_external_join(guild_id, uid, account["password"])
+                payload = result.get("data", result) if isinstance(result, dict) else {}
+                success = bool(
+                    200 <= http_status < 300
+                    and isinstance(payload, dict)
+                    and (
+                        payload.get("success") is True
+                        or str(payload.get("status", "")).lower() in {"success", "ok", "accepted"}
+                    )
+                )
+                message = payload.get("message", "") if isinstance(payload, dict) else ""
+                if http_status >= 200 and http_status < 300 and not isinstance(payload, dict):
+                    success = True
+                label = "Join request accepted" if success else "Join request failed"
+                bot_state.log(f"UID {uid}: {label}" + (f" | {message}" if message else f" | HTTP {http_status}"), "success" if success else "error", uid)
+                results.append({"uid": uid, "success": success, "http_status": http_status, "message": str(message)})
+                bot_state.automation["joined" if success else "failed"] += 1
+            except Exception as exc:
+                bot_state.automation["failed"] += 1
+                results.append({"uid": uid, "success": False, "error": str(exc)})
+                bot_state.log(f"UID {uid}: Join request failed | {exc}", "error", uid)
+            await asyncio.sleep(2)
+
+        bot_state.automation.update({
+            "running": False, "stage": "done",
+            "message": f"Guild join finished: {bot_state.automation['joined']} accepted, {bot_state.automation['failed']} failed. Gameplay was not started."
+        })
+        bot_state.log(bot_state.automation["message"], "success" if bot_state.automation["joined"] else "warning")
+    except Exception as exc:
+        bot_state.automation.update({"running": False, "stage": "error", "message": str(exc)})
+        bot_state.log(f"Guild join failed: {exc}", "error")
+
+
+async def handle_api_guild_join(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    guild_id = str(body.get("guild_id", "")).strip()
+    region = str(body.get("region", "IND")).strip().upper() or "IND"
+    try:
+        account_count = int(body.get("account_count", 0))
+        if account_count < 0 or account_count > 48:
+            raise ValueError
+    except (TypeError, ValueError):
+        return web.json_response({"status": "error", "error": "Account count must be 0–48 (0 = ALL)"}, status=400)
+    if not guild_id:
+        return web.json_response({"status": "error", "error": "Guild ID is required"}, status=400)
+    if bot_state.automation.get("running"):
+        return web.json_response({"status": "busy", "error": "Another automation is already running", "automation": bot_state.automation}, status=409)
+    bot_state.automation_task = asyncio.create_task(_run_guild_join_only(guild_id, region, account_count))
+    return web.json_response({"status": "started", "message": "Guild join started for saved accounts. Gameplay will not start.", "automation": bot_state.automation})
+
+
 async def handle_api_automation(request: web.Request) -> web.Response:
     return web.json_response({"status": "success", "automation": bot_state.automation, "guild": bot_state.guild_config, "glory_started": bot_state.glory_started, "guild_live": bot_state.guild_live})
 
@@ -919,12 +1141,16 @@ async def handle_api_setup(request: web.Request) -> web.Response:
         body = {}
     guild_id = str(body.get("guild_id", "")).strip()
     region = str(body.get("region", "IND")).strip().upper() or "IND"
+    try:
+        account_count = max(0, min(48, int(body.get("account_count", 0))))
+    except Exception:
+        return web.json_response({"status": "error", "error": "Account count must be between 0 and 48 (0 = ALL)"}, status=400)
     if not guild_id:
         return web.json_response({"status": "error", "error": "Guild ID is required"}, status=400)
     if bot_state.automation.get("running"):
         return web.json_response({"status": "busy", "automation": bot_state.automation}, status=409)
-    asyncio.create_task(_run_automation(guild_id, region, 0, 1, False))
-    return web.json_response({"status": "started", "message": "Automation started. Use /api/automation for progress."})
+    asyncio.create_task(_run_automation(guild_id, region, 0, 1, False, account_count))
+    return web.json_response({"status": "started", "message": "Start Glory request accepted. Use Live Logs for progress."})
 
 
 async def handle_api_guild_config(request: web.Request) -> web.Response:
@@ -1170,9 +1396,10 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                     existing = json.load(f)
                 new_existing = []
                 for acc in existing:
-                    acc_uid = str(acc.get("uid", "")).strip()
+                    acc_uid = str(acc.get("uid") or acc.get("login_uid") or "").strip()
                     acc_tok = str(acc.get("token", "")).strip()
-                    is_match = False
+                    acc_other_ids = {str(acc.get(k, "")).strip() for k in ("account_id", "game_uid", "auth_uid", "user_id")}
+                    is_match = bool(acc_other_ids & candidate_ids)
                     if acc_uid and acc_uid in candidate_ids:
                         is_match = True
                     if acc_tok and (acc_tok in candidate_ids or acc_tok in target_tokens):
@@ -1187,6 +1414,55 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                     json.dump(new_existing, f, indent=2)
             except Exception:
                 pass
+
+        # Permanently remove this UID from every account source/archive and group assignment.
+        # This is intentionally UID-scoped; unrelated accounts and group ordering are preserved.
+        uid_keys = {"uid", "login_uid", "account_id", "game_uid", "auth_uid", "user_id"}
+        for filename in ("account_ind.json", "account_bd.json", "accounts_archive.json", "account_profiles.json", "banned_accounts.json", "Account_BD.txt"):
+            fpath = os.path.join(PROJECT_DIR, filename)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                if filename.lower().endswith(".txt"):
+                    lines = open(fpath, "r", encoding="utf-8", errors="ignore").readlines()
+                    kept = [line for line in lines if not any(cid and cid in line for cid in candidate_ids)]
+                    if len(kept) != len(lines):
+                        with open(fpath, "w", encoding="utf-8") as fh:
+                            fh.writelines(kept)
+                    continue
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    stored = json.load(fh)
+                changed = False
+                if isinstance(stored, list):
+                    kept = []
+                    for row in stored:
+                        vals = {str(row.get(k, "")).strip() for k in uid_keys} if isinstance(row, dict) else set()
+                        if vals & candidate_ids:
+                            changed = True
+                        else:
+                            kept.append(row)
+                    stored = kept
+                elif isinstance(stored, dict):
+                    for key in list(stored):
+                        row = stored[key]
+                        vals = {str(key).strip()}
+                        if isinstance(row, dict):
+                            vals.update(str(row.get(k, "")).strip() for k in uid_keys)
+                        if vals & candidate_ids:
+                            del stored[key]
+                            changed = True
+                if changed:
+                    _write_json_atomic(fpath, stored)
+            except Exception as cleanup_exc:
+                bot_state.log(f"Could not clean {filename} during account deletion: {cleanup_exc}", "warning")
+
+        try:
+            groups_data = _sync_account_groups()
+            for group in groups_data.get("groups", []):
+                group["uids"] = [str(x) for x in group.get("uids", []) if str(x) not in candidate_ids]
+            _write_json_atomic(GROUPS_FILE, groups_data)
+        except Exception as cleanup_exc:
+            bot_state.log(f"Could not update group assignments: {cleanup_exc}", "warning")
 
         # Remove matching devices from devices.json
         devices_file = "devices.json"
@@ -1242,6 +1518,7 @@ async def handle_delete_account(request: web.Request) -> web.Response:
 
         for cid in candidate_ids:
             bot_state.close_writers_for_account(cid)
+
 
         # Trigger on_account_deleted callback in Main.py if registered
         if "on_account_deleted" in bot_state.refresh_callbacks:
@@ -1478,12 +1755,176 @@ async def handle_api_guild_refresh(request: web.Request) -> web.Response:
                                   "guild": bot_state.guild_config, "guild_live": bot_state.guild_live}, status=502)
 
 
+async def handle_normal_matchmaking_start(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        chosen, selected = _selected_group_roster(body.get("group_ids", []))
+        if not selected:
+            return web.json_response({"status": "error", "error": "Select at least one complete unlocked group"}, status=400)
+        callback = bot_state.refresh_callbacks.get("on_glory_start")
+        if not callback:
+            return web.json_response({"status": "error", "error": "Normal Glory worker callback is not ready; start app.py first"}, status=503)
+        bot_state.glory_started = True
+        result = await callback(selected)
+        labels = [g.get("group") for g in chosen]
+        bot_state.log(f"Normal matchmaking started for {len(selected)} account(s) in {', '.join(labels)}", "success")
+        return web.json_response({"status": "started", "accounts": len(selected), "groups": labels, "result": result})
+    except Exception as exc:
+        bot_state.log(f"Normal matchmaking start failed: {exc}", "error")
+        return web.json_response({"status": "error", "error": str(exc)}, status=500)
+
+
+async def handle_group_lock(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        group_id = str(body.get("group_id", "")).strip()
+        locked = bool(body.get("locked", True))
+        normalised = _normalise_group_ids([group_id])
+        if not normalised:
+            raise ValueError("Valid group number is required")
+        groups_payload = _sync_account_groups()
+        current = next((g for g in groups_payload.get("groups", []) if g.get("group") == normalised[0]), None)
+        if current is None:
+            raise ValueError(f"{normalised[0]} does not exist")
+        uids = [str(x) for x in current.get("uids", [])]
+        if locked and not current.get("locked"):
+            # Remember only accounts that were active before locking so Unlock
+            # does not resume accounts that the operator had already paused.
+            current["paused_before_lock"] = [uid for uid in uids if not bot_state.is_paused(uid)]
+            for uid in current["paused_before_lock"]:
+                bot_state.toggle_pause(uid)
+        elif not locked and current.get("locked"):
+            for uid in current.get("paused_before_lock", []):
+                if bot_state.is_paused(uid):
+                    bot_state.toggle_pause(uid)
+            current["paused_before_lock"] = []
+        _write_json_atomic(GROUPS_FILE, groups_payload)
+        group = _set_group_lock(group_id, locked)
+        state = "locked/offline" if locked else "unlocked/available"
+        bot_state.log(f"{group['group']} is now {state}", "warning" if locked else "success")
+        return web.json_response({"status": "success", "group": group})
+    except Exception as exc:
+        return web.json_response({"status": "error", "error": str(exc)}, status=400)
+
+
+async def handle_account_create(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        name = str(body.get("name", "Account")).strip() or "Account"
+        quantity = int(body.get("quantity", 1))
+        region = str(body.get("region", "IND")).strip().upper()
+        if quantity < 1 or quantity > 48:
+            return web.json_response({"status": "error", "error": "Quantity must be between 1 and 48"}, status=400)
+        if region not in {"BD", "IND"}:
+            return web.json_response({"status": "error", "error": "Generator supports BD or IND region"}, status=400)
+        if bot_state.automation.get("running"):
+            return web.json_response({"status": "busy", "error": "Another account automation is running"}, status=409)
+        task = asyncio.create_task(_run_account_creation(name, quantity, region))
+        bot_state.automation_task = task
+        return web.json_response({"status": "started", "message": f"Generating {quantity} account(s)", "automation": bot_state.automation})
+    except (TypeError, ValueError):
+        return web.json_response({"status": "error", "error": "Invalid quantity"}, status=400)
+    except Exception as exc:
+        return web.json_response({"status": "error", "error": str(exc)}, status=500)
+
+
+async def _run_account_creation(name: str, quantity: int, region: str):
+    bot_state.automation.update({"running": True, "stage": "account_create", "target": quantity, "created": 0, "joined": 0, "failed": 0, "message": "Starting account generator", "started_at": time.time()})
+    try:
+        import importlib.util
+        generator_path = os.path.join(PROJECT_DIR, "main.py")
+        spec = importlib.util.spec_from_file_location("glory_account_generator", generator_path)
+        if not spec or not spec.loader:
+            raise RuntimeError("main.py generator could not be loaded")
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        if generator.is_system_expired():
+            raise RuntimeError("The existing main.py account generator is expired")
+        generator.set_custom_name(name)
+        region_file = "account_bd.json" if region == "BD" else "account_ind.json"
+        semaphore = asyncio.Semaphore(25)
+        progress_lock = asyncio.Lock()
+        attempts = 0
+        in_flight = 0
+        max_attempts = max(quantity * 20, 30)
+        async def progress(status, data=None):
+            async with progress_lock:
+                if status == "success":
+                    bot_state.automation["created"] += 1
+                    bot_state.log(f"Account created: {data.get('name')} | UID {data.get('uid')}", "success")
+        async def worker():
+            nonlocal attempts, in_flight
+            while attempts < max_attempts:
+                async with progress_lock:
+                    if bot_state.automation["created"] + in_flight >= quantity or attempts >= max_attempts:
+                        return
+                    attempts += 1
+                    in_flight += 1
+                result = None
+                try:
+                    result = await generator.generate_one(semaphore, progress, region, "en", region_file, "loginbp.ppmainecoonghj.com", "OB55", "1.134.14")
+                except Exception as exc:
+                    bot_state.log(f"Account generator attempt failed: {exc}", "warning")
+                finally:
+                    async with progress_lock:
+                        in_flight = max(0, in_flight - 1)
+                if result is None:
+                    await asyncio.sleep(0.15)
+        workers = [asyncio.create_task(worker()) for _ in range(min(20, quantity * 2))]
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        # main.py writes both the regional generator file and accounts.json.
+        # Reconcile the regional file into the canonical dashboard store as a
+        # defensive compatibility step; append-only UID merge prevents loss.
+        regional_path = os.path.join(PROJECT_DIR, region_file)
+        regional_rows = _read_json_list(regional_path)
+        canonical_path = os.path.join(PROJECT_DIR, "accounts.json")
+        canonical_rows = _read_json_list(canonical_path)
+        known_uids = {str(row.get("uid") or row.get("login_uid") or "").strip()
+                      for row in canonical_rows if isinstance(row, dict)}
+        merged = 0
+        for row in regional_rows:
+            if not isinstance(row, dict):
+                continue
+            uid = str(row.get("uid") or row.get("login_uid") or "").strip()
+            password = str(row.get("password") or "").strip()
+            if not uid or not password or uid in known_uids:
+                continue
+            canonical_rows.append({
+                "uid": uid,
+                "password": password,
+                "account_id": str(row.get("account_id") or row.get("game_uid") or ""),
+                "nickname": str(row.get("nickname") or row.get("name") or name),
+                "region": str(row.get("region") or row.get("server") or region),
+                "created_at": row.get("created_at") or row.get("saved_at") or int(time.time()),
+            })
+            known_uids.add(uid)
+            merged += 1
+        if merged:
+            _write_json_atomic(canonical_path, canonical_rows)
+            bot_state.log(f"Synced {merged} generated account(s) into Account Manager", "success")
+
+        groups = _sync_account_groups()
+        created = int(bot_state.automation.get("created", 0))
+        bot_state.automation.update({"running": False, "stage": "done", "message": f"Created {created} of {quantity}; {len(canonical_rows)} saved account(s); groups synchronized", "groups": len(groups.get("groups", []))})
+        bot_state.log(bot_state.automation["message"], "success" if created else "warning")
+    except Exception as exc:
+        bot_state.automation.update({"running": False, "stage": "error", "message": str(exc)})
+        bot_state.log(f"Account creation failed: {exc}", "error")
+
+
+async def handle_api_groups(request: web.Request) -> web.Response:
+    return web.json_response({"status": "success", **_sync_account_groups()})
+
+
 # ==================== START WEB DASHBOARD ====================
 
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app = web.Application()
     app.router.add_get("/", handle_index)
+    app.router.add_get("/api/health", handle_health)
     app.router.add_post("/api/setup", handle_api_setup)
+    app.router.add_post("/api/guild/join", handle_api_guild_join)
     app.router.add_post("/api/start", handle_api_start)
     app.router.add_get("/api/automation", handle_api_automation)
     app.router.add_get("/api/guild-config", handle_api_guild_config)
@@ -1493,6 +1934,10 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_get("/api/logs", handle_api_logs)
     app.router.add_post("/api/account/add", handle_add_account)
+    app.router.add_post("/api/accounts/create", handle_account_create)
+    app.router.add_get("/api/groups", handle_api_groups)
+    app.router.add_post("/api/groups/lock", handle_group_lock)
+    app.router.add_post("/api/matchmaking/normal/start", handle_normal_matchmaking_start)
     app.router.add_post("/api/accounts/old/activate", handle_activate_old)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
@@ -1503,8 +1948,13 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
+    try:
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+    except Exception:
+        # Release partially-created listeners before app.py retries another port.
+        await runner.cleanup()
+        raise
     _archive_accounts()      # dashboard start par bhi: jo accounts accounts.json mein hain unka archive
     try:
         asyncio.create_task(_guild_live_loop())
