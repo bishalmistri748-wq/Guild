@@ -34,6 +34,9 @@ DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 4500
 
 START_MATCH_INTERVAL    = 4.0
+# Overlapping matchmaking: only enable concurrent sessions up to this per-account cap.
+OVERLAPPING_MATCH_INTERVAL = float(os.getenv("OVERLAPPING_MATCH_INTERVAL", "60"))
+MAX_CONCURRENT_MATCHES_PER_ACCOUNT = int(os.getenv("MAX_CONCURRENT_MATCHES_PER_ACCOUNT", "2"))
 NEW_MATCH_DELAY         = 6.0
 MAX_MATCH_DURATION      = 3000
 MATCH_IDLE_TIMEOUT      = 90.0
@@ -2041,8 +2044,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     team_coord_task = asyncio.create_task(_team_coordinator())
                     member_trigger_task = asyncio.create_task(_member_match_trigger())
                 else:
-                    # ⭐ Always Battle Royale
+                    # Initial search. Further searches are scheduled while earlier UDP matches run.
                     await start_game_battle_royale(current_search_region, client_version, writer, current_key, current_iv)
+                search_pending = True
+                last_search_started = asyncio.get_running_loop().time()
+                search_attempts = 1 if not TEAM_MODE else 0
+                match_sequence = 0
+                seen_match_codes = set()
 
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
@@ -2051,13 +2059,33 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     except Exception: pass
 
                     now = asyncio.get_running_loop().time()
+                    # Start another search only after the previous search produced a match,
+                    # and only while below the configured concurrent-session cap.
+                    if (not search_pending
+                            and len(play_matches) < max(1, MAX_CONCURRENT_MATCHES_PER_ACCOUNT)
+                            and now - last_search_started >= max(1.0, OVERLAPPING_MATCH_INTERVAL)):
+                        if TEAM_MODE:
+                            # Re-trigger this account's existing squad matchmaking flow once.
+                            match_account = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
+                            ready_packet = ready_for_game(int(match_account), current_key, current_iv)
+                            writer.write(ready_packet); await writer.drain()
+                            await asyncio.sleep(1.0)
+                            start_packet = start_match_team(int(match_account), current_key, current_iv, region=account_region)
+                            writer.write(start_packet); await writer.drain()
+                        else:
+                            await start_game_battle_royale(current_search_region, client_version, writer, current_key, current_iv)
+                        search_pending = True
+                        last_search_started = now
+                        search_attempts += 1
+                        print_info(f"[MATCH SCHEDULER] {uid_str}: next search sent; active={len(play_matches)}")
                     if now - last_watchdog_check >= MATCH_WATCHDOG_CHECK:
                         last_watchdog_check = now
-                        sd = now - connection_start_time
-                        if sd > 30: print_warning(f"[WATCHDOG] {uid_str} searching {int(sd)}s att={search_attempts}")
-                        if sd > MATCH_SEARCH_TIMEOUT:
-                            raise ConnectionError("Search watchdog")
-                    if search_attempts >= MAX_SEARCH_ATTEMPTS:
+                        if search_pending:
+                            sd = now - last_search_started
+                            if sd > 30: print_warning(f"[WATCHDOG] {uid_str} searching {int(sd)}s att={search_attempts}")
+                            if sd > MATCH_SEARCH_TIMEOUT:
+                                raise ConnectionError("Search watchdog")
+                    if search_pending and search_attempts >= MAX_SEARCH_ATTEMPTS:
                         raise ConnectionError("Max attempts")
 
                     try:
@@ -2092,6 +2120,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         continue
 
                     if hex_data.startswith("0300") and pl >= 300:
+                        search_pending = False
+                        last_search_started = asyncio.get_running_loop().time()
                         print_colored("=" * 60, Colors.GREEN)
                         print_colored("MATCH FOUND! Loading...", Colors.GREEN)
                         print_colored("=" * 60, Colors.GREEN)
@@ -2123,6 +2153,11 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                             effective = match_account_id or account_id or "BD_BOT"
                             if token and udp_key and match_code and server_ip_port:
+                                match_code_key = str(match_code)
+                                if match_code_key in seen_match_codes:
+                                    print_warning(f"[MATCH] duplicate match response ignored: {match_code_key}")
+                                    continue
+                                seen_match_codes.add(match_code_key)
                                 try:
                                     async with team_state["lock"]:
                                         team_state["pk_code"] = str(match_code)
@@ -2142,7 +2177,9 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     server_ip=server_ip_port, region=account_region,
                                     client_version=client_version, access_token=acc_tok,
                                     mode_id=mid, map_id=mp)
-                                match_index = await _inc_match(uid_str)
+                                await _inc_match(uid_str)
+                                match_sequence += 1
+                                match_index = match_sequence
                                 total = await _get_total_match_count()
                                 print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} ({tag})", Colors.CYAN)
 
@@ -2154,38 +2191,17 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 play_matches.append(new_match)
                                 consecutive_parse_failures = 0
 
-                                async def drain_gw():
-                                    while not new_match.done():
-                                        try:
-                                            dg = await asyncio.wait_for(reader.read(4096), timeout=1.0)
-                                            if not dg: break
-                                            gh = dg.hex()
-                                            if gh.startswith("0600") and len(dg) > 20:
-                                                await _process_social_packet(dg, current_account_data, tag="DRAIN")
-                                        except asyncio.TimeoutError: continue
-                                        except Exception: break
-                                drain_task = asyncio.create_task(drain_gw())
-                                try: await new_match
-                                except Exception as e: print_error(f"[MATCH #{match_index}] {e}")
-                                finally:
-                                    drain_task.cancel()
-                                    try: await drain_task
-                                    except asyncio.CancelledError: pass
-                                play_matches[:] = [m for m in play_matches if not m.done()]
-
+                                # Keep the TCP gateway alive. The UDP match owns its own
+                                # socket/task, so the next matchmaking request can be sent
+                                # without waiting for this match to finish.
+                                print_success(
+                                    f"[MATCH #{match_index}] running in background; "
+                                    f"active={len([t for t in play_matches if not t.done()])}"
+                                )
                                 async with team_state["lock"]:
-                                    team_state["peers"].pop(uid_str, None)
-                                    if team_state["leader_uid"] == uid_str:
-                                        team_state["leader_uid"] = None
-                                    team_state["pk_code"] = None
-                                await _team_member_leave(team_state, uid_str)
+                                    team_state["pk_code"] = str(match_code)
+                                    team_state["team_code"] = str(match_code)
                                 _team_active["flag"] = True
-                                try: writer.close(); await writer.wait_closed()
-                                except Exception: pass
-                                print_info(f"[FUNC] {uid_str} reconnect in {NEW_MATCH_DELAY}s...")
-                                await asyncio.sleep(NEW_MATCH_DELAY)
-                                reconnect_count_total += 1
-                                break
                             else:
                                 consecutive_parse_failures += 1
                                 print_warning(f"[FUNC] Non-match big pkt #{consecutive_parse_failures}")
