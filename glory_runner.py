@@ -2,11 +2,12 @@
 # ═══════════════════════════════════════════════════════════════════
 #  TEAM RBC — Squad Bot (Create → Invite → Accept → PK → In-Game)
 # ═══════════════════════════════════════════════════════════════════
-import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid, signal
+import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid, signal, logging
 
 # Keep runtime JSON files and Web_temp anchored to this project directory.
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import itertools, secrets, traceback, base64
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -27,6 +28,40 @@ import RbcFF_pb2
 import thunderFF_pb2
 
 from dashboard_server import bot_state, start_web_dashboard
+
+# ═══════════════════════════ DIAGNOSTICS ═══════════════════════════
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glory_runner.log")
+_logger = logging.getLogger("glory_runner")
+_logger.setLevel(logging.INFO)
+if not _logger.handlers:
+    _file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    _logger.addHandler(_file_handler)
+
+def _log_exception(context, exc, level=logging.ERROR):
+    """Write full exception details to the rotating log without logging credentials."""
+    try:
+        _logger.log(level, "%s | %s: %s", context, type(exc).__name__, exc,
+                    exc_info=(type(exc), exc, exc.__traceback__))
+    except Exception:
+        pass
+
+def _asyncio_exception_handler(loop, context):
+    exc = context.get("exception")
+    message = context.get("message", "Unhandled asyncio exception")
+    if exc is not None:
+        _log_exception(message, exc)
+    else:
+        _logger.error("%s | context=%r", message, context)
+    try:
+        loop.default_exception_handler(context)
+    except Exception:
+        pass
+
+def _install_runtime_diagnostics(loop):
+    loop.set_exception_handler(_asyncio_exception_handler)
+    _logger.info("Runtime diagnostics initialized | python=%s | platform=%s",
+                 sys.version.split()[0], sys.platform)
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 WEB_HOST = "0.0.0.0"
@@ -237,8 +272,15 @@ def optimize_udp_socket(sock):
     except Exception: pass
 
 # ═══════════════════════════ HTTP CLIENT ═══════════════════════════
+async def _http_response_diagnostics(response):
+    if response.status_code >= 400:
+        request = response.request
+        _logger.warning("HTTP response error | method=%s host=%s path=%s status=%s",
+                        request.method, request.url.host, request.url.path, response.status_code)
+
 client = httpx.AsyncClient(verify=False, timeout=10.0,
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50))
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+    event_hooks={"response": [_http_response_diagnostics]})
 headers = {
     'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
     'Connection': 'Keep-Alive', 'Accept-Encoding': 'gzip',
@@ -578,7 +620,9 @@ async def version_config():
         su = d.get("server_url"); rv = d.get("remote_version"); lr = d.get("latest_release_version")
         if not su or not rv or not lr: return None
         return lr, rv, su
-    except Exception: return None
+    except Exception as exc:
+        _log_exception("Fetch game version configuration", exc, logging.WARNING)
+        return None
 
 async def get_access_token(uid, password):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
@@ -601,7 +645,8 @@ async def get_access_token(uid, password):
                 oid = d.get("open_id"); at = d.get("access_token"); pf = d.get("platform", 4)
                 if oid and at: return oid, at, pf
             if r.status_code == 429: await asyncio.sleep(1); continue
-        except Exception: pass
+        except Exception as exc:
+            _log_exception(f"Guest token request attempt {attempt + 1}/5", exc, logging.WARNING)
         await asyncio.sleep(0.5)
     return None
 
@@ -829,6 +874,7 @@ async def build_majorlogin_payload(open_id, access_token, platform, client_versi
         }
         return encrypt_api_bytes(build_proto(p))
     except Exception as e:
+        _log_exception("Build major login payload", e)
         print_error(f"build_majorlogin_payload: {e}"); return None
 
 async def send_majorlogin(data, release_version, server_url):
@@ -847,6 +893,7 @@ async def send_majorlogin(data, release_version, server_url):
             except Exception: continue
         return None
     except Exception as e:
+        _log_exception("MajorLogin HTTP request", e)
         print_error(f"[MAJORLOGIN] {e}"); return None
 
 async def send_getlogin(data, base_url, token, release_version):
@@ -890,6 +937,7 @@ async def send_getlogin(data, base_url, token, release_version):
             return None
         return rp, dd
     except Exception as e:
+        _log_exception("GetLoginData HTTP request", e)
         print_error(f"[GETLOGIN] {type(e).__name__}: {e}")
         return None
 
@@ -914,7 +962,9 @@ async def send_ping(account_id, token, release_version):
         }
         r = await client.post(PING_URL, headers=hdrs, content=payload, timeout=PING_TIMEOUT)
         return r.status_code == 200
-    except Exception: return False
+    except Exception as exc:
+        _log_exception(f"HTTP ping account={account_id}", exc, logging.WARNING)
+        return False
 
 async def ping_worker(account_id, token, release_version, region="ID"):
     if not ENABLE_HTTP_PING: return
@@ -2276,6 +2326,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 await _team_member_leave(team_state, uid_str)
                 raise
             except Exception as e:
+                _log_exception(f"Gameplay TCP/session failure account={uid_str}", e, logging.WARNING)
                 if gateway_ping_task: gateway_ping_task.cancel()
                 # Report the actual failure class and socket errno without
                 # changing matchmaking, retry timing, or game-session behavior.
@@ -2370,11 +2421,12 @@ async def informational(addrs, starter_packet, key, iv, region="ID", max_reconne
                 try: writer.close(); await writer.wait_closed()
                 except Exception: pass
             raise
-        except Exception:
+        except Exception as exc:
+            _log_exception(f"Informational TCP connection {ip}:{port}", exc, logging.WARNING)
             if ping_task: ping_task.cancel()
             if writer:
                 try: writer.close(); await writer.wait_closed()
-                except Exception: pass
+                except Exception as close_exc: _log_exception("Close informational TCP writer", close_exc, logging.WARNING)
             reconnects += 1
             if reconnects > max_reconnects:
                 await asyncio.sleep(3); reconnects = 0
@@ -2560,6 +2612,7 @@ async def process_account_token(access_token):
         }
         _register_credentials(ad); cache_set(cache_key, ad); return ad
     except Exception as e:
+        _log_exception("Process token account login", e)
         print_error(f"process_account_token: {e}"); return None
 
 async def run_account_worker(ad, label):
@@ -2602,7 +2655,9 @@ async def run_account_worker(ad, label):
             ad['aes_ak'], ad['iv_i'], account_id=acc_id, account_data=ad,
             account_level=int(ad.get('level', 2) or 2))
     except asyncio.CancelledError: raise
-    except Exception as e: print_error(f"run_account_worker {label}: {e}")
+    except Exception as e:
+        _log_exception(f"Run account worker label={label}", e)
+        print_error(f"run_account_worker {label}: {e}")
     finally:
         for t in (info_task, exp_task, ping_task):
             if t and not t.done(): t.cancel()
@@ -2632,6 +2687,7 @@ async def account_loop_guest(uid, password):
             except Exception: pass
             break
         except Exception as e:
+            _log_exception(f"Account worker UID={uid}", e)
             print_error(f"Error {uid}: {e}, retry 10s")
             await asyncio.sleep(10)
 
@@ -2649,6 +2705,7 @@ async def account_loop_token(token):
         except asyncio.CancelledError:
             print_warning(f"Token {label} stopped"); break
         except Exception as e:
+            _log_exception(f"Token worker label={label}", e)
             print_error(f"Token error: {e}, retry 10s")
             await asyncio.sleep(10)
 
@@ -2677,6 +2734,7 @@ def load_accounts():
 
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
+    _install_runtime_diagnostics(asyncio.get_running_loop())
     print_colored("=" * 60, Colors.CYAN)
     print_colored("  TEAM RBC — Squad Bot (Create/Invite/Accept/PK)", Colors.GREEN)
     print_colored("=" * 60, Colors.CYAN)
@@ -2778,16 +2836,72 @@ async def main():
 
     # Telegram control removed: all administration is handled by the web dashboard.
 
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+    installed_signals = []
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, shutdown_event.set)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+    print_info(f"Detailed diagnostics: {LOG_FILE}")
     try:
-        while True: await asyncio.sleep(1)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        print_warning("Shutting down...")
-        for t in list(bot_state.account_workers.values()): t.cancel()
-        await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
-        print_success("Closed.")
+        await shutdown_event.wait()
+    finally:
+        print_warning("Shutting down: cancelling account workers and closing network resources...")
+        workers = list(getattr(bot_state, "account_workers", {}).values())
+        for task in workers:
+            if task and not task.done():
+                task.cancel()
+        if workers:
+            results = await asyncio.gather(*workers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                    _log_exception("Account worker shutdown", result)
+
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks()
+                   if task is not current and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        try:
+            await client.aclose()
+        except Exception as exc:
+            _log_exception("Close shared HTTP client", exc)
+
+        for sig in installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except Exception:
+                pass
+        try:
+            bot_state.refresh_callbacks.pop("on_account_added", None)
+            bot_state.refresh_callbacks.pop("on_glory_start", None)
+            bot_state.refresh_callbacks.pop("on_refresh_account", None)
+        except Exception:
+            pass
+        print_success("Shutdown complete; workers stopped and HTTP client closed.")
+
+async def _entrypoint():
+    try:
+        await main()
+    finally:
+        if not client.is_closed:
+            await client.aclose()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(_entrypoint())
     except KeyboardInterrupt:
+        _logger.info("Stopped by keyboard interrupt")
         print_warning("stopped")
+    except Exception as exc:
+        _log_exception("Fatal application error", exc)
+        print_error(f"Fatal error: {type(exc).__name__}: {exc}")
